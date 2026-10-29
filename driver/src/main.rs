@@ -448,7 +448,7 @@ mod tests {
 
     fn fixture() -> (plist::Value, plist::Value) {
         let lockdown = dict(
-            r#"<dict><key>UDID</key><string>00008101-000000000000001E</string>
+            r#"<dict><key>UDID</key><string>00008101-0123456789ABCDEF</string>
             <key>SystemBUID</key><string>BUID</string><key>WiFiMACAddress</key><string>00:11:22:33:44:55</string>
             <key>HostID</key><string>host-uuid</string><key>EscrowBag</key><data>AAAA</data>
             <key>RootPrivateKey</key><data>AAAA</data><key>HostPrivateKey</key><data>AAAA</data>
