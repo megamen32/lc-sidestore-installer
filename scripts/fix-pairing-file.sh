@@ -13,6 +13,13 @@ set -euo pipefail
 command -v pymobiledevice3 >/dev/null || { echo "pymobiledevice3 is required: pipx install pymobiledevice3" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 2; }
 
+# ideviceinstaller is faster and its output is plain CSV; pymobiledevice3 prints a table,
+# which the bundle-id grep below handles either way.
+list_installed() {
+  if command -v ideviceinstaller >/dev/null 2>&1; then ideviceinstaller list --user 2>/dev/null
+  else pymobiledevice3 apps list --user 2>/dev/null; fi
+}
+
 bundle="${BUNDLE:-}"
 if [[ -z "$bundle" ]]; then
   # sed -n '1p' instead of head -1: head closes the pipe early and SIGPIPE + pipefail
