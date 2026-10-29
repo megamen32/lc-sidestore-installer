@@ -1,0 +1,16 @@
+# Never commit signing material or device credentials.
+driver/target/
+
+# pairing files are device secrets
+pairing_merged.plist
+*.mobiledevicepairing
+ALTPairingFile*
+
+# anisette / certificate state, keychains, downloads and logs
+anisette_state
+adi.pb
+*.p12
+*.pem
+*.log
+*.ipa
+.env

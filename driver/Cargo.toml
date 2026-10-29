@@ -1,0 +1,19 @@
+[package]
+name = "lc-sidestore-driver"
+version = "0.1.0"
+edition = "2024"
+description = "Headless installer for LiveContainer+SideStore that also generates and places a remote pairing file"
+license = "MIT"
+
+[dependencies]
+# Pinned to the revision whose GrandSlam/anisette handling matches iloader 2.4.x.
+# Bump only after re-testing sign-in; Apple regularly breaks the old client identities.
+isideload = { git = "https://github.com/nab138/isideload", rev = "326e56229d0727cb6e7b34c8cf03e37e2cd3e17d", default-features = false, features = ["install", "fs-storage", "tokio-mt"] }
+idevice = { version = "0.1.61", default-features = false, features = ["usbmuxd", "ring", "afc", "house_arrest", "installation_proxy", "remote_pairing", "rsd"] }
+plist = "1.8"
+plist-macro = "0.1.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
