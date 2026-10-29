@@ -1,10 +1,10 @@
 # lc-sidestore-installer
 
 Headless installer for **LiveContainer + embedded SideStore** on a physical iPhone, plus the
-part people usually get wrong: it generates a **merged lockdown + remote-pairing file** and
-writes it into the LiveContainer document directory, so the SideStore running inside
-LiveContainer can talk to the phone and re-sign apps **without a Mac and without weekly
-re-signing**.
+part people usually get wrong: it performs **remote pairing**, writes the pairing file into the
+LiveContainer document directory in the one-protocol-per-file shape SideStore 0.7 demands, and
+therefore lets the SideStore running inside LiveContainer talk to the phone and re-sign apps
+**without a Mac and without weekly re-signing**.
 
 It is a ~350-line Rust driver on top of
 [`nab138/isideload`](https://github.com/nab138/isideload) (the engine of
@@ -72,6 +72,16 @@ SideStore embedded:     0.7.0-20261017.511+ee3cc16a
                         OK - this build can sign in to Apple ID.
 ```
 
+## Scripts
+
+| Script | What it does |
+| --- | --- |
+| `scripts/latest-builds.sh` | Queries GitHub for the newest LiveContainer/SideStore/iloader builds and prints the IPA URLs. |
+| `scripts/inspect-ipa.sh <ipa>` | Shows the LiveContainer version and the version of the SideStore embedded in that IPA. |
+| `scripts/preflight.sh` | Device + Developer Mode + remote pairing check. No password, no install. |
+| `scripts/install.sh <apple-id> [ipa]` | Full run: pair, sign in, sign, install, place pairing files. |
+| `scripts/fix-pairing-file.sh [merged.plist]` | Repairs an already-installed SideStore that is stuck on "pairing file format is ambiguous". |
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -117,19 +127,62 @@ exit 30** instead of silently destroying the signature that keeps your other app
 1. Install **LocalDevVPN** from the App Store and leave it *connected*. It provides the network
    extension tunnel SideStore uses to reach the phone's own services. Without it you get
    "no ipsec/IKEv2 interface found" style failures.
-2. Open LiveContainer → SideStore → Settings → **Pairing File**: it should already be there
-   because the driver wrote it to
-   `com.kdt.livecontainer…:/Documents/SideStore/Documents/ALTPairingFile.mobiledevicepairing`.
-   If SideStore still refuses it, set **Remote Pairing as Preferred** in
-   Settings → Developer → Remote Pairing.
-3. SideStore → Account → sign in with the same Apple ID, then **Refresh All**.
-4. Enable **on-device anisette** *only if* the refresh succeeds. Since mid-October 2026 a wave of
-   `-80045` / `22411` errors hits accounts that use it: if refresh fails with those codes, turn
-   **On-device Anisette OFF**, point SideStore at a remote anisette server
-   (e.g. `https://ani.iloader.app`, `https://mac-ani.jkcoxson.com`, `https://new.ani.sidestore.io`)
-   and delete `adi.pb` from SideStore's documents so it re-registers.
-5. If you had AltStore/altstore-like signers installed, delete them afterwards to free the slot —
-   **only after** step 3 proved SideStore can refresh.
+2. Open LiveContainer → SideStore → Settings → **Pairing File**. The driver already wrote
+   protocol-pure copies into
+   `com.kdt.livecontainer…:/Documents/SideStore/Documents/`, so this should just be green.
+   See [the ambiguous-format trap](#the-ambiguous-pairing-file-trap) if it is not.
+3. SideStore → Account → sign in with the same Apple ID. If it fails, see
+   [`-80045`](#-80045-the-anisette-wave) below before retrying the password.
+4. **Resign SideStore → App Contains Extensions** → choose
+   **Keep App Extensions (Use Main Profile)**. A free account is allowed 10 new App IDs per week;
+   the bundle carries 4 extensions, and "Register App ID for Each Extension" burns 4 of those 10
+   on every re-sign. "Use Main Profile" costs one, which is also what the driver did on the Mac
+   (`ExtensionsBehavior::ReuseMain`).
+5. SideStore → **Refresh All**, and confirm the apps inside LiveContainer get new certificates.
+6. Only after step 5 works, delete AltStore (or any other signer) to free the slot. Apps it
+   signed keep working: SideStore sees every user app on the device and refreshes anything signed
+   with your own certificate.
+
+## The ambiguous pairing file trap
+
+SideStore 0.7 loads the pairing file through minimuxer with `preferred: nil`
+(`SideStore/Core/DeviceApi/MinimuxerWrapper.swift` → `minimuxer.core.start(pairingFile:mountPath:)`),
+and `PairingFileParser.validatePairingFile` throws as soon as a plist satisfies *both* key sets:
+
+> The pairing file format is ambiguous: The pairing file contains credentials for both Remote
+> Pairing and Lockdown protocols. Specify a preferred protocol to resolve ambiguity.
+
+Every classic tool — iloader included — writes exactly such a merged file, so the newest
+SideStore rejects the thing that used to be the recommended setup
+([SideStore#1608](https://github.com/SideStore/SideStore/issues/1608)). The fix is one protocol
+per file, which is what the driver writes:
+
+| File in `/Documents/SideStore/Documents/` | Content |
+| --- | --- |
+| `ALTPairingFile.mobiledevicepairing` | remote-pairing only (`identifier`, `public_key`, `private_key`) |
+| `PairingFile_RemoteRP.plist` | same, remote-pairing only — what SideStore uses on iOS 17.4+ |
+| `PairingFile_Lockdown.plist` | lockdown only (the 10 classic keys) — legacy path |
+| `pairing_merged.plist` (on the computer) | both halves, for Mac-side tools |
+
+Already stuck on that screen? `scripts/fix-pairing-file.sh` pulls the merged file out of the
+container, splits it and pushes the pure copies back. Force-quit LiveContainer first:
+`house_arrest` refuses to open a container while the app is running.
+
+## `-80045` (the anisette wave)
+
+Since mid-October 2026 signing in fails with *"This action cannot be completed at this time.
+(-80045)"* while the password is correct
+([SideStore#1675](https://github.com/SideStore/SideStore/issues/1675),
+[#1658](https://github.com/SideStore/SideStore/issues/1658)). Confirmed working sequence, done
+inside SideStore:
+
+1. **User Customizations → On-Device Anisette: OFF** (restart the app when asked).
+2. **Anisette servers → SideStore (New)**, then **disable "Enable auto rotation"** at the bottom,
+   otherwise the provider rotates back to a broken one.
+3. **User Customizations → Anisette client configuration → Remote server sync → Fetch → Save as
+   overrides**.
+4. **User Customizations → Reset adi.pb**.
+5. Sign in again; the first attempt can take noticeably longer than usual.
 
 ## Troubleshooting
 
@@ -137,9 +190,11 @@ exit 30** instead of silently destroying the signature that keeps your other app
 | --- | --- |
 | `No devices found over usbmuxd` | Phone locked, "Trust This Computer" not tapped, or `usbmuxd` not running. `brew services start usbmuxd`. |
 | `remote pairing: … (Developer Mode is off)` | Settings → Privacy & Security → Developer Mode → ON, reboot, unlock, re-run `preflight`. |
+| "The pairing file format is ambiguous" | Merged file; run `scripts/fix-pairing-file.sh` (see above). |
 | HTTP 503 during sign-in | SideStore 0.6.4 embedded (see above) or a stale anisette state — re-install the nightly bundle / reset anisette. |
-| `-80045` / `22411` on refresh | Disable On-device Anisette, use a remote anisette server, delete `adi.pb`. |
+| `-80045` / `22411` on sign-in or refresh | The anisette wave — follow the five steps above. |
 | SMS 2FA returns 403 | Use a trusted-device code (`d` at the prompt). |
+| `usbmuxd rejected the Connect request: {'Number': 2}` on push | LiveContainer is running; force-quit it and retry. |
 | Second LiveContainer appeared, apps missing | You signed with a different team; re-install with the original `EXPECTED_TEAM`. |
 | Apps expired after 7 days | SideStore never refreshed: LocalDevVPN off, pairing file missing, or account not signed in inside SideStore. |
 
@@ -163,6 +218,14 @@ cd driver && cargo build --release -j 4
 Dependencies are pinned: `isideload` to git rev `326e56229d0727cb6e7b34c8cf03e37e2cd3e17d`
 (the revision whose Grand Slam / anisette handling matches iloader 2.4.x) and `idevice` 0.1.61+.
 Cargo.lock is committed so the build is reproducible.
+
+```bash
+cd driver && cargo test -j 4
+```
+
+The three tests cover the pairing-file split (remote-pairing-only has no lockdown keys,
+lockdown-only has no remote-pairing keys, merged has both) — the invariant that keeps SideStore
+from reporting an ambiguous format. They need no device.
 
 ## Credits
 

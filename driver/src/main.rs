@@ -34,12 +34,52 @@ fn read_line(prompt: &str) -> String {
     trimmed
 }
 
+/// SideStore's minimuxer refuses a plist that satisfies both protocols:
+/// "The pairing file format is ambiguous" (SideStore#1608). It calls
+/// `start(pairingFile:mountPath:)` without a `preferred:` argument, so the file itself has
+/// to carry exactly one protocol. Hence three variants instead of one merged blob.
+struct PairingFiles {
+    /// lockdown + remote pairing: what a Mac-side tool (pymobiledevice3, idevice, iloader) wants.
+    merged: Vec<u8>,
+    /// remote pairing only: what SideStore on iOS 17.4+ should load.
+    rp_only: Vec<u8>,
+    /// lockdown only: what SideStore loads on older iOS.
+    lockdown_only: Vec<u8>,
+}
+
+/// Splits the two pairing records into the three files SideStore and Mac tooling expect.
+/// Pure, so the "ambiguous format" guard can be tested without a phone.
+fn make_pairing_files(
+    lockdown_plist: plist::Value,
+    rp_plist: plist::Value,
+) -> Result<PairingFiles, String> {
+    let lockdown_only = plist_to_xml_bytes(
+        lockdown_plist
+            .as_dictionary()
+            .ok_or_else(|| "lockdown pair record is not a dictionary".to_string())?,
+    );
+    let rp_only = plist_to_xml_bytes(
+        rp_plist
+            .as_dictionary()
+            .ok_or_else(|| "rppairing file is not a dictionary".to_string())?,
+    );
+    let merged = plist!(dict {
+        :< lockdown_plist,
+        :< rp_plist,
+    });
+    Ok(PairingFiles {
+        merged: plist_to_xml_bytes(&merged),
+        rp_only,
+        lockdown_only,
+    })
+}
+
 /// Build the merged lockdown + remote-pairing plist that SideStore needs on iOS 17.4+.
 async fn build_pairing_file(
     udid: &str,
     provider: &impl IdeviceProvider,
     usbmuxd: &mut UsbmuxdConnection,
-) -> Result<Vec<u8>, String> {
+) -> Result<PairingFiles, String> {
     let mut lockdown_pair = usbmuxd
         .get_pair_record(udid)
         .await
@@ -82,11 +122,7 @@ async fn build_pairing_file(
     })?;
     let rp_plist = plist::Value::from_reader_xml(std::io::Cursor::new(rp.to_bytes()))
         .map_err(|e| format!("parse rppairing plist: {e}"))?;
-    let merged = plist!(dict {
-        :< lockdown_plist,
-        :< rp_plist,
-    });
-    Ok(plist_to_xml_bytes(&merged))
+    make_pairing_files(lockdown_plist, rp_plist)
 }
 
 #[tokio::main]
@@ -140,7 +176,7 @@ async fn main() {
     let provider = chosen.to_provider(UsbmuxdAddr::from_env_var().unwrap(), "lcsidestore-driver");
 
     println!("=== STEP B: build merged lockdown + remote pairing file ===");
-    let pairing_bytes = match build_pairing_file(&chosen.udid, &provider, &mut usbmuxd).await {
+    let files = match build_pairing_file(&chosen.udid, &provider, &mut usbmuxd).await {
         Ok(b) => b,
         Err(e) => {
             println!("PAIRING FILE FAILED: {e}");
@@ -148,10 +184,10 @@ async fn main() {
             std::process::exit(20);
         }
     };
-    std::fs::write(&pairing_out, &pairing_bytes).expect("write pairing file");
+    std::fs::write(&pairing_out, &files.merged).expect("write pairing file");
     println!(
-        "=== STEP B OK: pairing file ({} bytes) at {pairing_out} ===",
-        pairing_bytes.len()
+        "=== STEP B OK: pairing file ({} bytes, merged) at {pairing_out} ===",
+        files.merged.len()
     );
 
     if mode == "preflight" {
@@ -294,13 +330,13 @@ async fn main() {
             ipa_path.clone(),
             true,
             None::<fn(f32) -> std::future::Ready<()>>,
-            Some(&pairing_bytes),
+            Some(&files.merged),
         )
         .await
         .expect("install_app failed");
     println!("install finished, special app = {special:?}");
 
-    println!("=== STEP G: place pairing file into the container ===");
+    println!("=== STEP G: place pairing files into the container ===");
     let mut ip = InstallationProxyClient::connect(&provider)
         .await
         .expect("installation proxy connect");
@@ -338,15 +374,125 @@ async fn main() {
         .await
         .expect("vend documents");
     afc.mk_dir("/Documents/SideStore/Documents").await.ok();
-    let target = "/Documents/SideStore/Documents/ALTPairingFile.mobiledevicepairing";
-    let mut f = afc
-        .open(target.to_string(), AfcFopenMode::Wr)
-        .await
-        .expect("open pairing target");
-    f.write_entire(&pairing_bytes)
-        .await
-        .expect("write pairing");
-    f.close().await.expect("close pairing");
-    println!("=== STEP G OK: pairing file placed at {lc_bundle}:{target} ===");
-    println!("DONE. {lc_bundle} {lc_version} installed with embedded SideStore and a placed remote pairing file.");
+
+    // ALTPairingFile.mobiledevicepairing is what SideStore imports on launch; it copies the
+    // content to PairingFile_RemoteRP.plist / PairingFile_Lockdown.plist. Writing all three
+    // keeps the import idempotent and each file unambiguous.
+    let placements: [(&str, &Vec<u8>); 3] = [
+        (
+            "/Documents/SideStore/Documents/ALTPairingFile.mobiledevicepairing",
+            &files.rp_only,
+        ),
+        (
+            "/Documents/SideStore/Documents/PairingFile_RemoteRP.plist",
+            &files.rp_only,
+        ),
+        (
+            "/Documents/SideStore/Documents/PairingFile_Lockdown.plist",
+            &files.lockdown_only,
+        ),
+    ];
+    for (target, bytes) in placements {
+        let mut f = afc
+            .open(target.to_string(), AfcFopenMode::Wr)
+            .await
+            .unwrap_or_else(|e| panic!("open {target}: {e}"));
+        f.write_entire(bytes)
+            .await
+            .unwrap_or_else(|e| panic!("write {target}: {e}"));
+        f.close()
+            .await
+            .unwrap_or_else(|e| panic!("close {target}: {e}"));
+        println!("placed {} bytes at {lc_bundle}:{target}", bytes.len());
+    }
+    println!(
+        "DONE. {lc_bundle} {lc_version} installed with embedded SideStore; pairing files placed (remote-pairing-only where SideStore reads them, so it cannot report an ambiguous format)."
+    );
+    println!("On the phone: force-quit LiveContainer, reopen, SideStore > Settings > Pairing File should show Remote Pairing without warnings.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(xml: &str) -> plist::Value {
+        plist::Value::from_reader(std::io::Cursor::new(xml.as_bytes())).expect("fixture plist")
+    }
+
+    fn keys(bytes: &[u8]) -> Vec<String> {
+        let mut k: Vec<String> = plist::Value::from_reader_xml(std::io::Cursor::new(bytes.to_vec()))
+            .expect("output is valid plist xml")
+            .as_dictionary()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    }
+
+    // Mirrors the required-key lists in SideStore/minimuxer Common/PairingFile.swift.
+    const RP: [&str; 3] = ["identifier", "private_key", "public_key"];
+    const LD: [&str; 10] = [
+        "WiFiMACAddress",
+        "SystemBUID",
+        "RootPrivateKey",
+        "HostPrivateKey",
+        "HostID",
+        "RootCertificate",
+        "UDID",
+        "EscrowBag",
+        "HostCertificate",
+        "DeviceCertificate",
+    ];
+
+    fn fixture() -> (plist::Value, plist::Value) {
+        let lockdown = dict(
+            r#"<dict><key>UDID</key><string>00008101-000000000000001E</string>
+            <key>SystemBUID</key><string>BUID</string><key>WiFiMACAddress</key><string>00:11:22:33:44:55</string>
+            <key>HostID</key><string>host-uuid</string><key>EscrowBag</key><data>AAAA</data>
+            <key>RootPrivateKey</key><data>AAAA</data><key>HostPrivateKey</key><data>AAAA</data>
+            <key>RootCertificate</key><data>AAAA</data><key>HostCertificate</key><data>AAAA</data>
+            <key>DeviceCertificate</key><data>AAAA</data></dict>"#,
+        );
+        let rp = dict(
+            r#"<dict><key>identifier</key><string>rp-uuid</string>
+            <key>public_key</key><data>AAAA</data><key>private_key</key><data>AAAA</data>
+            <key>alt_irk</key><data>AAAA</data></dict>"#,
+        );
+        (lockdown, rp)
+    }
+
+    #[test]
+    fn rp_only_file_is_not_ambiguous() {
+        let (l, r) = fixture();
+        let files = make_pairing_files(l, r).unwrap();
+        let k = keys(&files.rp_only);
+        assert!(RP.iter().all(|key| k.contains(&key.to_string())), "rp keys: {k:?}");
+        for bad in LD {
+            assert!(!k.contains(&bad.to_string()), "lockdown key {bad} leaked into rp_only");
+        }
+    }
+
+    #[test]
+    fn lockdown_only_file_is_not_ambiguous() {
+        let (l, r) = fixture();
+        let files = make_pairing_files(l, r).unwrap();
+        let k = keys(&files.lockdown_only);
+        assert!(LD.iter().all(|key| k.contains(&key.to_string())), "lockdown keys: {k:?}");
+        for bad in RP {
+            assert!(!k.contains(&bad.to_string()), "remote-pairing key {bad} leaked into lockdown_only");
+        }
+    }
+
+    #[test]
+    fn merged_file_carries_both_halves_for_mac_tooling() {
+        let (l, r) = fixture();
+        let files = make_pairing_files(l, r).unwrap();
+        let k = keys(&files.merged);
+        assert!(
+            RP.iter().chain(LD.iter()).all(|key| k.contains(&key.to_string())),
+            "merged keys: {k:?}"
+        );
+    }
 }
